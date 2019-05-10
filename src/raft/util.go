@@ -8,7 +8,11 @@ import (
 )
 
 // Debugging
-const Debug = 0
+const Debug = 1
+
+func init() {
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -34,4 +38,18 @@ func Int63nRange(min, max int64) int64 {
 
 func durationRange(min, max time.Duration) time.Duration {
 	return time.Duration(Int63nRange(int64(min), int64(max)))
+}
+
+func maxInt32(a, b int32) int32 {
+	if a >= b {
+		return a
+	}
+	return b
+}
+
+func minInt32(a, b int32) int32 {
+	if a <= b {
+		return a
+	}
+	return b
 }
