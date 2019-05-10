@@ -60,7 +60,7 @@ func TestReElection2A(t *testing.T) {
 	cfg.connect(leader1)
 	leader2 := cfg.checkOneLeader()
 
-	fmt.Println("TestReElection2A: rejoin leader2 and a random node, no leader should be elected")
+	fmt.Println("TestReElection2A: disconnect leader2 and a random node, no leader should be elected")
 	// if there's no quorum, no leader should
 	// be elected.
 	cfg.disconnect(leader2)
