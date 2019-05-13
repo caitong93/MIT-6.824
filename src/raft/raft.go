@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"context"
+	"encoding/gob"
 	"fmt"
 	"reflect"
 	"sync"
@@ -72,12 +74,13 @@ type Raft struct {
 	// Volatile state on leaders
 	leader *leaderNode
 
-	readyCh         chan struct{}
-	appendEntriesCh chan Operation
-	requestVoteCh   chan Operation
-	resetElectionCh chan time.Time
-	electionTimeout time.Duration
-	applyCh         chan<- ApplyMsg
+	readyCh              chan struct{}
+	appendEntriesCh      chan Operation
+	requestVoteCh        chan Operation
+	resetElectionCh      chan time.Time
+	electionTimeout      time.Duration
+	applyCh              chan<- ApplyMsg
+	lastPersistSignature []byte
 
 	ctx    context.Context
 	cancel func()
@@ -113,6 +116,25 @@ func (rf *Raft) isLeader() bool {
 	return rf.role == RaftRoleLeader
 }
 
+const sep = '\xff'
+
+func (rf *Raft) calcPersistSig() []byte {
+	sig := []byte{}
+	sig = append(sig, fmt.Sprintf("%x", rf.currentTerm)...)
+	sig = append(sig, sep)
+	sig = append(sig, fmt.Sprintf("%x", rf.votedFor)...)
+	sig = append(sig, sep)
+	sig = append(sig, fmt.Sprintf("%x", len(rf.logs))...)
+	if len(rf.logs) > 0 {
+		lastLogIndex := len(rf.logs) - 1
+		sig = append(sig, sep)
+		sig = append(sig, fmt.Sprintf("%x", rf.logs[lastLogIndex].Term)...)
+		sig = append(sig, sep)
+		sig = append(sig, fmt.Sprintf("%v", rf.logs[lastLogIndex].Command)...)
+	}
+	return sig
+}
+
 //
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
@@ -127,6 +149,21 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
+	sig := rf.calcPersistSig()
+	if reflect.DeepEqual(sig, rf.lastPersistSignature) {
+		return
+	}
+	rf.lastPersistSignature = sig
+
+	DPrintf("Persist. node=%v,role=%v,term=%v,lastLogIndex=%v", rf.me, rf.role, rf.currentTerm, rf.getLastLogIndex())
+
+	w := new(bytes.Buffer)
+	enc := gob.NewEncoder(w)
+	enc.Encode(rf.currentTerm)
+	enc.Encode(rf.votedFor)
+	enc.Encode(rf.logs)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
@@ -142,6 +179,23 @@ func (rf *Raft) readPersist(data []byte) {
 	if data == nil || len(data) < 1 { // bootstrap without any state?
 		return
 	}
+
+	r := bytes.NewBuffer(data)
+	dec := gob.NewDecoder(r)
+	if err := dec.Decode(&rf.currentTerm); err != nil {
+		DPrintf("Err decode:%v", err)
+	}
+	if err := dec.Decode(&rf.votedFor); err != nil {
+		DPrintf("Err decode: %v", err)
+	}
+	if rf.logs == nil {
+		rf.logs = []LogEntry{}
+	}
+	if err := dec.Decode(&rf.logs); err != nil {
+		DPrintf("Err decode: %v", err)
+	}
+
+	DPrintf("Read persist data. node=%v,role=%v,term=%v,votedFor=%v,logs=%v", rf.me, rf.role, rf.currentTerm, rf.votedFor, rf.logs)
 }
 
 //
@@ -205,6 +259,8 @@ func (rf *Raft) requestVoteLoop() {
 func (rf *Raft) handleRequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer rf.persist()
 
 	defer func() {
 		DPrintf("RequestVote done. node=%v,term=%v,role=%v,votedFor=%v. Args: candidate=%v,term=%v,lastLogIndex=%v,lastLogTerm=%v. success=%v", rf.me, rf.currentTerm, rf.role, rf.votedFor, args.CandidateID, args.Term, args.LastLogIndex, args.LastLogTerm, reply.VoteGranted)
@@ -334,8 +390,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int32
-	Success bool
+	Term         int32
+	Success      bool
+	PrevLogTerm  int32
+	PrevLogIndex int32
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -388,9 +446,22 @@ func atLeastUpToDate(lastLogTerm, lastLogIndex, localLastLogTerm, localLastLogIn
 	return lastLogIndex >= localLastLogIndex
 }
 
+func (rf *Raft) findFirstIndexOfTerm(term int32) int32 {
+	ret := rf.getLastLogIndex()
+	for i := len(rf.logs) - 1; i >= 1; i-- {
+		if rf.logs[i].Term < term {
+			break
+		}
+		ret = int32(i)
+	}
+	return ret
+}
+
 func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+
+	defer rf.persist()
 
 	if len(args.Entries) > 0 {
 		defer func() {
@@ -423,6 +494,13 @@ func (rf *Raft) handleAppendEntries(args *AppendEntriesArgs, reply *AppendEntrie
 	}
 
 	if !containPrevLog {
+		if args.PrevLogIndex > lastLogIndex {
+			reply.PrevLogIndex = rf.findFirstIndexOfTerm(args.PrevLogTerm)
+			reply.PrevLogTerm = rf.logs[reply.PrevLogIndex].Term
+		} else {
+			reply.PrevLogIndex = rf.findFirstIndexOfTerm(rf.logs[args.PrevLogIndex].Term)
+			reply.PrevLogTerm = rf.logs[reply.PrevLogIndex].Term
+		}
 		return
 	}
 
@@ -470,6 +548,8 @@ func (rf *Raft) commit(commitIndex int32) {
 	}
 	originalIndex := rf.commitIndex
 	rf.commitIndex = commitIndex
+	// TODO: persist should be called only once in a single lock context
+	rf.persist()
 	// DPrintf("Commit. node=%v,from=%v,to=%v,logs=%v", rf.me, originalIndex+1, rf.commitIndex, rf.logs)
 	DPrintf("Commit. node=%v,from=%v,to=%v", rf.me, originalIndex+1, rf.commitIndex)
 }
@@ -584,6 +664,7 @@ func (rf *Raft) gatherVotes() {
 		}
 		if reply.Term > rf.currentTerm {
 			rf.becomeFollower(reply.Term)
+			rf.persist()
 			rf.mu.Unlock()
 			return
 		}
@@ -591,6 +672,7 @@ func (rf *Raft) gatherVotes() {
 			grantedVotes++
 			if grantedVotes*2 > peerNum {
 				rf.becomeLeader()
+				rf.persist()
 				rf.mu.Unlock()
 				return
 			}

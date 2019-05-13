@@ -19,10 +19,12 @@ type leaderNode struct {
 }
 
 type syncResult struct {
-	server       int32
-	term         int32
-	lastLogIndex int32
-	success      bool
+	server           int32
+	term             int32
+	lastLogIndex     int32
+	hintLastLogIndex int32
+	hintLastLogTerm  int32
+	success          bool
 }
 
 // rf should be locked to call newLeaderNode
@@ -116,14 +118,20 @@ func (l *leaderNode) onSyncFailure(r *syncResult) {
 
 	server := r.server
 	// After a rejection, the leader decrements nextIndex and reties the AppendEntries RPC
-	if l.nextIndex[server] > 1 {
-		l.nextIndex[server]--
+	if r.hintLastLogIndex > 0 && r.hintLastLogIndex < l.nextIndex[server] {
+		l.nextIndex[server] = r.hintLastLogIndex
+	} else {
+		if l.nextIndex[server] > 1 {
+			l.nextIndex[server]--
+		}
 	}
-	DPrintf("On failure, update nextIndex. node=%v,follower=%v,nextIndex=%v,followerTerm=%v", l.me, server, l.nextIndex[server], r.term)
+
+	DPrintf("On failure, update nextIndex. node=%v,follower=%v,nextIndex=%v,nextTerm=%v,followerTerm=%v,hintIndex=%v,hintTerm=%v", l.me, server, l.nextIndex[server], rf.logs[l.nextIndex[server]].Term, r.term, r.hintLastLogIndex, r.hintLastLogTerm)
 	if r.term > rf.currentTerm {
 		DPrintf("Follower have higher term than leader. leader=%v,term=%v,follower=%v,followerTerm=%v", rf.me, rf.currentTerm, server, r.term)
 		// Leader update term and become follower, then start election
 		rf.becomeFollower(r.term)
+		rf.persist()
 	} else {
 		// TODO: rate limit on failure retry
 		l.followers[r.server].Sync(l.syncResultCh)

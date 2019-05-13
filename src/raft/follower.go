@@ -127,10 +127,12 @@ func (fm *followerManager) syncLogs(ctx context.Context, server int, heartbeat b
 
 	if resultCh != nil {
 		resultCh <- syncResult{
-			server:       int32(server),
-			term:         reply.Term,
-			lastLogIndex: lastLogIndex,
-			success:      reply.Success,
+			server:           int32(server),
+			term:             reply.Term,
+			lastLogIndex:     lastLogIndex,
+			hintLastLogIndex: reply.PrevLogIndex,
+			hintLastLogTerm:  reply.PrevLogTerm,
+			success:          reply.Success,
 		}
 	}
 
